@@ -30,8 +30,8 @@ pub enum PasteHopError {
     TotalSizeTooLarge { limit_bytes: u64, actual_bytes: u64 },
     #[error("clipboard is unavailable: {message}")]
     ClipboardUnavailable { message: String },
-    #[error("clipboard does not currently contain an image")]
-    ClipboardNotImage,
+    #[error("clipboard does not currently contain supported files or an image")]
+    ClipboardNotSupported,
     #[error("failed to materialize clipboard content: {source}")]
     ClipboardIo {
         #[source]
@@ -98,7 +98,7 @@ impl PasteHopError {
             | Self::FileTooLarge { .. }
             | Self::TotalSizeTooLarge { .. }
             | Self::ClipboardUnavailable { .. }
-            | Self::ClipboardNotImage
+            | Self::ClipboardNotSupported
             | Self::ClipboardIo { .. }
             | Self::ClipboardImageEncoding { .. } => 2,
             Self::InstallIo { .. } => 4,

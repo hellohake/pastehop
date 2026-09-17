@@ -6,14 +6,14 @@ use crate::{
         AttachArgs, Cli, Command, DoctorArgs, GcArgs, HookArgs, HookTerminal, InstallArgs,
         TerminalHookArgs, TrustArgs, UninstallArgs,
     },
-    clipboard::{read_clipboard_image, write_clipboard_text},
+    clipboard::{ClipboardContent, read_clipboard_content, write_clipboard_text},
     config::{Config, ConfigStore},
     doctor::run_doctor,
     errors::PasteHopError,
     gc::run_gc,
     hook::HookResponse,
     install::{install_terminal, uninstall_terminal},
-    staging::{prepare_clipboard_upload, prepare_explicit_uploads},
+    staging::{PreparedUpload, prepare_clipboard_upload, prepare_explicit_uploads},
     target::{HookTargetContext, resolve_attach_target, resolve_hook_target},
     transport::Transport,
 };
@@ -40,20 +40,13 @@ fn handle_attach(args: AttachArgs) -> Result<()> {
     let target = resolve_attach_target(args.host.as_deref(), args.remote_dir.as_deref(), &config)
         .map_err(wrap)?;
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let mut clipboard_upload = None;
-    let uploads = if args.clipboard {
-        let clipboard = read_clipboard_image().map_err(wrap)?;
-        let upload = prepare_clipboard_upload(
-            clipboard.file.path(),
-            clipboard.size_bytes,
-            &target,
-            &config,
-            args.profile,
-            now,
-        )
-        .map_err(wrap)?;
-        clipboard_upload = Some(clipboard);
-        vec![upload]
+    let clipboard_content = if args.clipboard {
+        Some(read_clipboard_content().map_err(wrap)?)
+    } else {
+        None
+    };
+    let uploads = if let Some(content) = clipboard_content.as_ref() {
+        prepare_clipboard_content(content, &target, &config, args.profile, now).map_err(wrap)?
     } else {
         prepare_explicit_uploads(&args.paths, &target, &config, args.profile, now).map_err(wrap)?
     };
@@ -102,8 +95,6 @@ fn handle_attach(args: AttachArgs) -> Result<()> {
     for path in formatted_paths {
         println!("{path}");
     }
-
-    drop(clipboard_upload);
 
     Ok(())
 }
@@ -156,21 +147,14 @@ fn execute_hook(hook: TerminalHookArgs, config: &mut Config) -> HookResponse {
         return HookResponse::error(error.to_string());
     }
 
-    let clipboard = match read_clipboard_image() {
+    let clipboard = match read_clipboard_content() {
         Ok(clipboard) => clipboard,
-        Err(PasteHopError::ClipboardNotImage) => return HookResponse::passthrough_key(),
+        Err(PasteHopError::ClipboardNotSupported) => return HookResponse::passthrough_key(),
         Err(error) => return HookResponse::error(error.to_string()),
     };
 
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let upload = match prepare_clipboard_upload(
-        clipboard.file.path(),
-        clipboard.size_bytes,
-        &target,
-        config,
-        hook.profile,
-        now,
-    ) {
+    let uploads = match prepare_clipboard_content(&clipboard, &target, config, hook.profile, now) {
         Ok(upload) => upload,
         Err(error) => return HookResponse::error(error.to_string()),
     };
@@ -182,15 +166,49 @@ fn execute_hook(hook: TerminalHookArgs, config: &mut Config) -> HookResponse {
 
     let _ = transport.cleanup_expired(&target.host, &target.remote_dir, config.cleanup_ttl_hours);
 
-    if let Err(error) = transport.ensure_remote_dir(&target.host, &upload.remote_path) {
-        return HookResponse::error(error.to_string());
-    }
-    if let Err(error) = transport.upload_file(&target.host, &upload.local_path, &upload.remote_path)
-    {
-        return HookResponse::error(error.to_string());
+    for upload in &uploads {
+        if let Err(error) = transport.ensure_remote_dir(&target.host, &upload.remote_path) {
+            return HookResponse::error(error.to_string());
+        }
+        if let Err(error) =
+            transport.upload_file(&target.host, &upload.local_path, &upload.remote_path)
+        {
+            return HookResponse::error(error.to_string());
+        }
     }
 
-    HookResponse::inject_text(upload.formatted_remote_path)
+    HookResponse::inject_text(format_hook_paths(uploads))
+}
+
+fn prepare_clipboard_content(
+    content: &ClipboardContent,
+    target: &crate::target::ResolvedTarget,
+    config: &Config,
+    profile: crate::profiles::PathProfile,
+    now: OffsetDateTime,
+) -> Result<Vec<PreparedUpload>, PasteHopError> {
+    match content {
+        ClipboardContent::Files(paths) => {
+            prepare_explicit_uploads(paths, target, config, profile, now)
+        }
+        ClipboardContent::Image(image) => prepare_clipboard_upload(
+            image.file.path(),
+            image.size_bytes,
+            target,
+            config,
+            profile,
+            now,
+        )
+        .map(|upload| vec![upload]),
+    }
+}
+
+fn format_hook_paths(uploads: Vec<PreparedUpload>) -> String {
+    uploads
+        .into_iter()
+        .map(|upload| upload.formatted_remote_path)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn handle_install(args: InstallArgs) -> Result<()> {
@@ -270,11 +288,101 @@ fn wrap(error: PasteHopError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, fs};
+
     use tempfile::TempDir;
+    use time::OffsetDateTime;
 
-    use crate::config::ConfigStore;
+    use crate::{
+        cli::TerminalHookArgs,
+        clipboard::ClipboardContent,
+        config::{Config, ConfigStore},
+        hook::HookAction,
+        profiles::PathProfile,
+        target::{ResolutionSource, ResolvedTarget},
+    };
 
-    use super::{ensure_host_allowed, trust_host};
+    use super::{
+        ensure_host_allowed, execute_hook, format_hook_paths, prepare_clipboard_content, trust_host,
+    };
+
+    #[test]
+    fn clipboard_files_use_explicit_file_upload_rules() {
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        let first = temp_dir.path().join("Screen Recording.mov");
+        let second = temp_dir.path().join("Demo.MP4");
+        fs::write(&first, b"mov").expect("first video should exist");
+        fs::write(&second, b"mp4").expect("second video should exist");
+        let content = ClipboardContent::Files(vec![first, second]);
+        let target = ResolvedTarget {
+            host: "devbox".to_owned(),
+            remote_dir: "/srv/uploads".to_owned(),
+            source: ResolutionSource::ExplicitHost,
+        };
+        let now =
+            OffsetDateTime::from_unix_timestamp(1_762_892_645).expect("timestamp should be valid");
+
+        let uploads = prepare_clipboard_content(
+            &content,
+            &target,
+            &Config::default(),
+            PathProfile::PlainPath,
+            now,
+        )
+        .expect("clipboard files should prepare");
+
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads[0].remote_path.ends_with("-screen-recording.mov"));
+        assert!(uploads[1].remote_path.ends_with("-demo.mp4"));
+    }
+
+    #[test]
+    fn multiple_hook_paths_are_joined_without_newlines() {
+        let uploads = vec![
+            crate::staging::PreparedUpload {
+                local_path: "/tmp/first.mov".into(),
+                remote_path: "/srv/first.mov".to_owned(),
+                formatted_remote_path: "/srv/first.mov".to_owned(),
+                size_bytes: 3,
+            },
+            crate::staging::PreparedUpload {
+                local_path: "/tmp/second.mp4".into(),
+                remote_path: "/srv/second.mp4".to_owned(),
+                formatted_remote_path: "/srv/second.mp4".to_owned(),
+                size_bytes: 3,
+            },
+        ];
+
+        assert_eq!(format_hook_paths(uploads), "/srv/first.mov /srv/second.mp4");
+    }
+
+    #[test]
+    fn local_terminal_passthrough_happens_before_clipboard_inspection() {
+        let _guard = crate::clipboard::CLIPBOARD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            env::set_var("PH_FAKE_CLIPBOARD_IMAGE", "/missing/image.png");
+        }
+        let response = execute_hook(
+            TerminalHookArgs {
+                host: None,
+                remote_dir: None,
+                profile: PathProfile::PlainPath,
+                key: "CTRL+V".to_owned(),
+                domain: None,
+                foreground_process: Some("zsh".to_owned()),
+                cwd: Some("/tmp".to_owned()),
+                debug: false,
+            },
+            &mut Config::default(),
+        );
+        unsafe {
+            env::remove_var("PH_FAKE_CLIPBOARD_IMAGE");
+        }
+
+        assert_eq!(response.action, HookAction::PassthroughKey);
+    }
 
     #[test]
     fn unknown_hosts_are_rejected_without_prompting() {

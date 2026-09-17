@@ -6,7 +6,7 @@
 
 **Architecture:** Add a deep clipboard-content interface that resolves macOS file URLs before image pixels. Reuse the existing explicit-file preparation and transport path for files, while retaining the existing PNG materialization path for image pixels and native passthrough for unsupported content.
 
-**Tech Stack:** Rust 2024, objc2 AppKit/Foundation on macOS, arboard, tempfile, existing PasteHop staging and transport modules.
+**Tech Stack:** Rust 2024, arboard's macOS file-list adapter, tempfile, existing PasteHop staging and transport modules.
 
 ## Global Constraints
 
@@ -23,8 +23,6 @@
 ### Task 1: Model clipboard files and read macOS file URLs
 
 **Files:**
-- Modify: `Cargo.toml`
-- Modify: `Cargo.lock`
 - Modify: `src/clipboard.rs`
 - Modify: `src/errors.rs`
 
@@ -34,7 +32,7 @@
 
 - [ ] Add failing tests showing that file paths take precedence over image data and preserve multiple paths in order.
 - [ ] Run the focused clipboard tests and confirm failure because file clipboard content is not modeled.
-- [ ] Add target-specific objc2 dependencies and the private macOS pasteboard adapter for file URLs.
+- [ ] Reuse `arboard.get().file_list()` behind a macOS-only private helper.
 - [ ] Preserve `arboard` image fallback and rename the unsupported-content error without changing its exit code.
 - [ ] Run focused clipboard tests and confirm they pass.
 

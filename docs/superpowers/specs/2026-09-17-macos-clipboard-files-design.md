@@ -27,7 +27,7 @@ If file URLs are present but invalid, unreadable, not regular files, too numerou
 
 ## Architecture
 
-`clipboard.rs` exposes one deep interface, `read_clipboard_content()`, returning either `ClipboardContent::Files(Vec<PathBuf>)` or `ClipboardContent::Image(ClipboardImage)`. The macOS pasteboard implementation remains private behind that interface. Other platforms return no file URLs and continue through `arboard` image handling.
+`clipboard.rs` exposes one deep interface, `read_clipboard_content()`, returning either `ClipboardContent::Files(Vec<PathBuf>)` or `ClipboardContent::Image(ClipboardImage)`. It reuses `arboard`'s public file-list interface, whose macOS adapter reads Finder file URLs. File-list probing is enabled only on macOS so Linux and Windows retain their existing image behavior.
 
 `app.rs` maps clipboard files into the existing `prepare_explicit_uploads` flow and maps clipboard images into `prepare_clipboard_upload`. Both CLI `ph attach --clipboard` and terminal hooks share the same resolution behavior.
 
